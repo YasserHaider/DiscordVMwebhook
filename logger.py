@@ -506,13 +506,18 @@ class StatusPanel:
     def _post_panel(self, content: Optional[str] = None) -> None:
         body = {"content": content or self._format_status()}
         try:
-            resp = requests.post(self.system_webhook, json=body, timeout=5)
+            resp = requests.post(self.system_webhook + "?wait=true", json=body, timeout=5)
             if resp.ok:
-                data = resp.json()
-                self.message_id = data.get("id")
-                self.webhook_token = self.default_token
-                self.last_log_batch_time = time.time()
-                self._save_status_file()
+                try:
+                    data = resp.json()
+                except Exception:
+                    return
+                mid = data.get("id")
+                if isinstance(mid, str) and mid:
+                    self.message_id = mid
+                    self.webhook_token = self.default_token
+                    self.last_log_batch_time = time.time()
+                    self._save_status_file()
         except Exception:
             pass
 
