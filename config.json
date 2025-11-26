@@ -1,0 +1,9 @@
+{
+  "console_webhook": "https://discord.com/api/webhooks/XXX/ConsoleWebhookTokenExample",
+  "dashboard_webhook": "https://discord.com/api/webhooks/YYY/DashboardWebhookTokenExample",
+  "system_webhook": "https://discord.com/api/webhooks/ZZZ/SystemWebhookTokenExample",
+  "systemd_console_service": "redbot.service",
+  "systemd_dashboard_service": "reddash.service",
+  "systemd_recover_timer": "redbot-recover.timer",
+  "rate_limit_seconds": 0.75
+}
