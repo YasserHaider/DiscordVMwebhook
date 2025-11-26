@@ -144,11 +144,19 @@ def send_system_event(dispatcher: WebhookDispatcher, webhook_url: str, message: 
 class ErrorAggregator:
     """Captures complete error/traceback blocks for a stream without altering case."""
 
-    def __init__(self, stream_name: str, webhook_url: str, dispatcher: WebhookDispatcher, system_stream: bool) -> None:
+    def __init__(
+        self,
+        stream_name: str,
+        webhook_url: str,
+        dispatcher: WebhookDispatcher,
+        system_stream: bool,
+        status_panel: Optional["StatusPanel"] = None,
+    ) -> None:
         self.stream_name = stream_name
         self.webhook_url = webhook_url
         self.dispatcher = dispatcher
         self.system_stream = system_stream
+        self.status_panel = status_panel
         self.active = False
         self.lines: List[str] = []
         self.last_line_time: float = 0.0
@@ -186,13 +194,16 @@ class ErrorAggregator:
                 return
             block_text = "\n".join(self.lines)
             content = f"```log\n{block_text}\n```"
-            self.dispatcher.enqueue(self.webhook_url, content)
             alert = "⚠️ SYSTEM ERROR detected!" if self.system_stream else "⚠️ ERROR detected!"
             if self.system_stream:
                 alert = append_system_ping(alert)
             else:
                 alert = append_ping(alert, PING_ROLE_ID)
-            self.dispatcher.enqueue(self.webhook_url, alert)
+            if self.system_stream and self.status_panel:
+                self.status_panel.handle_log_batch([content, alert])
+            else:
+                self.dispatcher.enqueue(self.webhook_url, content)
+                self.dispatcher.enqueue(self.webhook_url, alert)
             self.active = False
             self.lines = []
             self.last_line_time = 0.0
@@ -212,6 +223,7 @@ class LogStream:
         system_stream: bool = False,
         recovery_monitor: Optional["RecoveryMonitor"] = None,
         label: str = "",
+        status_panel: Optional["StatusPanel"] = None,
     ) -> None:
         self.name = name
         self.command = command
@@ -222,9 +234,10 @@ class LogStream:
         self.system_stream = system_stream
         self.recovery_monitor = recovery_monitor
         self.label = label
+        self.status_panel = status_panel
         self.buffer: List[str] = []
         self.buffer_lock = threading.Lock()
-        self.error_agg = ErrorAggregator(name, webhook_url, dispatcher, system_stream)
+        self.error_agg = ErrorAggregator(name, webhook_url, dispatcher, system_stream, status_panel=status_panel)
         self.process = self._start_process()
         self.reader_thread = threading.Thread(target=self._reader, daemon=True)
         self.reader_thread.start()
@@ -289,7 +302,10 @@ class LogStream:
                 return
             content = "```log\n" + "\n".join(self.buffer) + "\n```"
             self.buffer.clear()
-        self.dispatcher.enqueue(self.webhook_url, content)
+        if self.system_stream and self.status_panel:
+            self.status_panel.handle_log_batch([content])
+        else:
+            self.dispatcher.enqueue(self.webhook_url, content)
 
     def terminate(self) -> None:
         try:
@@ -382,11 +398,13 @@ class RecoveryMonitor:
 class StatusPanel:
     """Maintains a single live-updating status message in the system webhook channel."""
 
-    def __init__(self, system_webhook: str) -> None:
+    def __init__(self, system_webhook: str, rate_limit_seconds: float) -> None:
         self.system_webhook = system_webhook
+        self.rate_limit_seconds = rate_limit_seconds
         self.message_id: Optional[str] = None
         self.last_net: Optional[psutil._common.snetio] = None
         self.lock = threading.Lock()
+        self.last_log_batch_time: float = 0.0
 
     def _format_status(self) -> str:
         cpu = psutil.cpu_percent(interval=None)
@@ -424,15 +442,43 @@ class StatusPanel:
             status += net_line
         return status
 
+    def _post_panel(self) -> None:
+        try:
+            resp = requests.post(self.system_webhook, json={"content": self._format_status()}, timeout=5)
+            if resp.ok:
+                data = resp.json()
+                self.message_id = data.get("id")
+                self.last_log_batch_time = time.time()
+        except Exception:
+            pass
+
+    def _delete_panel(self) -> None:
+        if not self.message_id:
+            return
+        try:
+            requests.delete(f"{self.system_webhook}/messages/{self.message_id}", timeout=5)
+        except Exception:
+            pass
+        self.message_id = None
+
+    def handle_log_batch(self, messages: List[str]) -> None:
+        with self.lock:
+            self._delete_panel()
+            for msg in messages:
+                try:
+                    requests.post(self.system_webhook, json={"content": msg}, timeout=5)
+                except Exception:
+                    pass
+                time.sleep(self.rate_limit_seconds)
+            self._post_panel()
+            self.last_log_batch_time = time.time()
+
     def update(self) -> None:
         content = self._format_status()
         with self.lock:
             try:
                 if self.message_id is None:
-                    resp = requests.post(self.system_webhook, json={"content": content}, timeout=5)
-                    if resp.ok:
-                        data = resp.json()
-                        self.message_id = data.get("id")
+                    self._post_panel()
                 else:
                     requests.patch(
                         f"{self.system_webhook}/messages/{self.message_id}",
@@ -501,6 +547,7 @@ def start_log_streams(
     system_webhook: str,
     config: Dict[str, Any],
     recovery_monitor: RecoveryMonitor,
+    status_panel: StatusPanel,
 ) -> List[LogStream]:
     streams: List[LogStream] = []
     console_unit = config.get("systemd_console_service", "redbot.service")
@@ -517,6 +564,7 @@ def start_log_streams(
             system_webhook=system_webhook,
             recovery_monitor=recovery_monitor,
             label="console",
+            status_panel=None,
         )
     )
 
@@ -530,6 +578,7 @@ def start_log_streams(
             system_webhook=system_webhook,
             recovery_monitor=recovery_monitor,
             label="dashboard",
+            status_panel=None,
         )
     )
 
@@ -544,6 +593,7 @@ def start_log_streams(
             system_stream=True,
             recovery_monitor=recovery_monitor,
             label="timer",
+            status_panel=status_panel,
         )
     )
 
@@ -559,6 +609,7 @@ def start_log_streams(
             system_stream=True,
             recovery_monitor=recovery_monitor,
             label="system",
+            status_panel=status_panel,
         )
     )
 
@@ -575,10 +626,14 @@ def main() -> None:
 
     recovery_monitor = RecoveryMonitor(config.get("systemd_console_service", "redbot.service"), system_webhook, dispatcher)
 
+    status_panel = StatusPanel(system_webhook, rate_limit_seconds)
+
     # Send startup event to system webhook with optional ping.
     send_system_event(dispatcher, system_webhook, "✅ Logger service started on Azure VM")
 
-    streams = start_log_streams(dispatcher, stop_event, system_webhook, config, recovery_monitor)
+    status_panel.update()
+
+    streams = start_log_streams(dispatcher, stop_event, system_webhook, config, recovery_monitor, status_panel)
 
     def handle_shutdown(signum: int, _frame: Any) -> None:
         # SIGTERM from systemd or Azure deallocation triggers graceful shutdown messaging.
@@ -595,7 +650,6 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
 
-    status_panel = StatusPanel(system_webhook)
     alerts = SystemAlertMonitor(dispatcher, system_webhook)
 
     def recovery_checker() -> None:
