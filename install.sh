@@ -9,7 +9,7 @@ INSTALL_DIR="/opt/discord-logger"
 SERVICE_FILE="/etc/systemd/system/azure-redbot-logger.service"
 
 sudo mkdir -p "${INSTALL_DIR}"
-sudo cp "${REPO_DIR}/logger.py" "${REPO_DIR}/config.json" "${REPO_DIR}/.env" "${INSTALL_DIR}/"
+sudo cp -r "${REPO_DIR}"/* "${INSTALL_DIR}"
 
 # Python environment with required packages.
 sudo python3 -m venv "${INSTALL_DIR}/venv"
@@ -26,14 +26,13 @@ Description=Azure Redbot Discord Logger
 After=network.target
 
 [Service]
-ExecStart=/opt/discord-logger/venv/bin/python /opt/discord-logger/logger.py
+Type=simple
 WorkingDirectory=/opt/discord-logger
-Restart=always
-RestartSec=3
-User=azureuser
-KillSignal=SIGTERM
-TimeoutStopSec=10
+ExecStart=/opt/discord-logger/venv/bin/python /opt/discord-logger/logger.py
+Restart=on-failure
+RestartSec=5
 Environment="PYTHONUNBUFFERED=1"
+# systemd sends SIGTERM first; the logger catches it to notify Discord before stopping.
 
 [Install]
 WantedBy=multi-user.target
