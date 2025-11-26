@@ -1,0 +1,16 @@
+[Unit]
+Description=Azure Redbot Discord Logger
+After=network.target
+
+[Service]
+ExecStart=/opt/discord-logger/venv/bin/python /opt/discord-logger/logger.py
+WorkingDirectory=/opt/discord-logger
+Restart=always
+RestartSec=3
+User=azureuser
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
