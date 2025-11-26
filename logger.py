@@ -7,7 +7,8 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import psutil
 import requests
@@ -54,6 +55,8 @@ SYSTEM_IMPORTANT_KEYS = [
 
 PING_ROLE_ID = os.getenv("PING_ROLE_ID", "")
 SYSTEM_PING_ROLE_ID = os.getenv("SYSTEM_PING_ROLE_ID", "")
+
+STATUS_FILE = "/opt/discord-logger/status.json"
 
 
 @dataclass
@@ -396,15 +399,69 @@ class RecoveryMonitor:
 
 
 class StatusPanel:
-    """Maintains a single live-updating status message in the system webhook channel."""
+    """Maintains a single live-updating status message in the system webhook channel with persistence."""
 
     def __init__(self, system_webhook: str, rate_limit_seconds: float) -> None:
         self.system_webhook = system_webhook
         self.rate_limit_seconds = rate_limit_seconds
         self.message_id: Optional[str] = None
+        self.webhook_id, self.default_token = self._parse_webhook_url(system_webhook)
+        self.webhook_token: Optional[str] = self.default_token
         self.last_net: Optional[psutil._common.snetio] = None
         self.lock = threading.Lock()
         self.last_log_batch_time: float = 0.0
+        self._load_status_file()
+
+    def _parse_webhook_url(self, webhook_url: str) -> Tuple[Optional[str], Optional[str]]:
+        parts = [p for p in urlsplit(webhook_url).path.split("/") if p]
+        if len(parts) >= 2:
+            return parts[-2], parts[-1]
+        return None, None
+
+    def _status_file_path(self) -> str:
+        return STATUS_FILE
+
+    def _load_status_file(self) -> None:
+        try:
+            with open(self._status_file_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                mid = data.get("message_id")
+                token = data.get("webhook_token")
+                if isinstance(mid, str) and isinstance(token, str) and mid and token:
+                    self.message_id = mid
+                    self.webhook_token = token
+        except Exception:
+            # On any failure, fall back to default behavior without crashing.
+            self.message_id = None
+
+    def _save_status_file(self) -> None:
+        if not self.message_id or not (self.webhook_token or self.default_token):
+            return
+        try:
+            os.makedirs(os.path.dirname(self._status_file_path()), exist_ok=True)
+            with open(self._status_file_path(), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "message_id": self.message_id,
+                        "webhook_token": self.webhook_token or self.default_token,
+                    },
+                    f,
+                )
+        except Exception:
+            pass
+
+    def _clear_status_file(self) -> None:
+        try:
+            os.remove(self._status_file_path())
+        except Exception:
+            pass
+
+    def _message_url(self) -> Optional[str]:
+        if not self.webhook_id or not (self.webhook_token or self.default_token) or not self.message_id:
+            return None
+        token = self.webhook_token or self.default_token
+        return f"https://discord.com/api/webhooks/{self.webhook_id}/{token}/messages/{self.message_id}"
 
     def _format_status(self) -> str:
         cpu = psutil.cpu_percent(interval=None)
@@ -427,13 +484,17 @@ class StatusPanel:
             recv_delta = max(now_net.bytes_recv - self.last_net.bytes_recv, 0)
             net_line = f"📡 Net: ↑ {sent_delta/1024/1024:.2f} MB/s · ↓ {recv_delta/1024/1024:.2f} MB/s\n"
         self.last_net = now_net
+        ram_used_gb = mem.used / (1024**3)
+        ram_total_gb = mem.total / (1024**3)
+        disk_used_gb = disk.used / (1024**3)
+        disk_total_gb = disk.total / (1024**3)
 
         status = (
             "🖥️ **VM Status — Live**\n\n"
             f"🧠 CPU: {cpu:.1f}%\n"
-            f"📦 RAM: {mem.used / (1024**3):.2f} / {mem.total / (1024**3):.2f} GB ({mem.percent:.1f}%)\n"
+            f"📦 RAM: {ram_used_gb:.2f} / {ram_total_gb:.2f} GB ({mem.percent:.1f}%)\n"
             f"🧊 Swap: {swap.used / (1024**3):.2f} / {swap.total / (1024**3):.2f} GB ({swap.percent:.1f}%)\n"
-            f"💾 Disk: {disk.percent:.1f}% used\n"
+            f"💾 Disk: {disk_used_gb:.2f} / {disk_total_gb:.2f} GB ({disk.percent:.1f}%)\n"
             f"🔺 Load: {load1:.2f} / {load5:.2f} / {load15:.2f}\n"
             f"🔁 I/O Wait: {iowait:.2f}%\n"
             f"⏱️ Uptime: {uptime}\n"
@@ -442,24 +503,51 @@ class StatusPanel:
             status += net_line
         return status
 
-    def _post_panel(self) -> None:
+    def _post_panel(self, content: Optional[str] = None) -> None:
+        body = {"content": content or self._format_status()}
         try:
-            resp = requests.post(self.system_webhook, json={"content": self._format_status()}, timeout=5)
+            resp = requests.post(self.system_webhook, json=body, timeout=5)
             if resp.ok:
                 data = resp.json()
                 self.message_id = data.get("id")
+                self.webhook_token = self.default_token
                 self.last_log_batch_time = time.time()
+                self._save_status_file()
         except Exception:
             pass
 
     def _delete_panel(self) -> None:
-        if not self.message_id:
+        url = self._message_url()
+        if not url:
+            self.message_id = None
+            self._clear_status_file()
             return
         try:
-            requests.delete(f"{self.system_webhook}/messages/{self.message_id}", timeout=5)
+            requests.delete(url, timeout=5)
         except Exception:
             pass
         self.message_id = None
+        self._clear_status_file()
+
+    def _patch_panel(self, content: str) -> bool:
+        url = self._message_url()
+        if not url:
+            return False
+        try:
+            resp = requests.patch(url, json={"content": content}, timeout=5)
+            return resp.ok
+        except Exception:
+            return False
+
+    def initialize(self) -> None:
+        content = self._format_status()
+        with self.lock:
+            if self.message_id and self.webhook_token:
+                if self._patch_panel(content):
+                    return
+            self.message_id = None
+            self._clear_status_file()
+            self._post_panel(content)
 
     def handle_log_batch(self, messages: List[str]) -> None:
         with self.lock:
@@ -476,18 +564,11 @@ class StatusPanel:
     def update(self) -> None:
         content = self._format_status()
         with self.lock:
-            try:
-                if self.message_id is None:
-                    self._post_panel()
-                else:
-                    requests.patch(
-                        f"{self.system_webhook}/messages/{self.message_id}",
-                        json={"content": content},
-                        timeout=5,
-                    )
-            except Exception:
-                # Never crash the logger on status update failures.
-                pass
+            if self.message_id and self._patch_panel(content):
+                return
+            self.message_id = None
+            self._clear_status_file()
+            self._post_panel(content)
 
 
 class SystemAlertMonitor:
@@ -631,7 +712,7 @@ def main() -> None:
     # Send startup event to system webhook with optional ping.
     send_system_event(dispatcher, system_webhook, "✅ Logger service started on Azure VM")
 
-    status_panel.update()
+    status_panel.initialize()
 
     streams = start_log_streams(dispatcher, stop_event, system_webhook, config, recovery_monitor, status_panel)
 
