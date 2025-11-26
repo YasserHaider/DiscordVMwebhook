@@ -5,5 +5,5 @@
   "systemd_console_service": "redbot.service",
   "systemd_dashboard_service": "reddash.service",
   "systemd_recover_timer": "redbot-recover.timer",
-  "rate_limit_seconds": 0.75
+  "rate_limit_seconds": 0.2
 }

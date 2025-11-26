@@ -14,7 +14,7 @@ sudo cp "${REPO_DIR}/logger.py" "${REPO_DIR}/config.json" "${REPO_DIR}/.env" "${
 # Python environment with required packages.
 sudo python3 -m venv "${INSTALL_DIR}/venv"
 "${INSTALL_DIR}/venv/bin/pip" install --upgrade pip
-"${INSTALL_DIR}/venv/bin/pip" install requests python-dotenv
+"${INSTALL_DIR}/venv/bin/pip" install requests python-dotenv psutil
 
 # Ensure config and env are only readable by root.
 sudo chmod 600 "${INSTALL_DIR}/config.json" "${INSTALL_DIR}/.env"
